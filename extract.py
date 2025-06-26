@@ -1,11 +1,11 @@
-import fitz  # PyMuPDF
+import fitz
 import pdfplumber
 import re
 import yaml
-import pytesseract
-import cv2
+# import pytesseract
 import numpy as np
-from transformers import VisionEncoderDecoderModel, ViTImageProcessor, AutoTokenizer
+from transformers import AutoTokenizer, AutoProcessor, AutoModelForImageTextToText, VisionEncoderDecoderModel, ViTImageProcessor
+from typing import Literal, final
 import torch
 from PIL import Image
 import os
@@ -15,11 +15,26 @@ import warnings
 from pathlib import Path
 from abc import ABC, abstractmethod
 import argparse
+import io
+from google import genai
+from google.genai import types
+import mimetypes
+
+
 
 warnings.filterwarnings("ignore")
 
-with open(Path("config/config.yaml").resolve(), "r", encoding="utf-8") as f:
-    config = yaml.safe_load(f)
+config= {}
+try:
+    with open(Path("config/config.yaml").resolve(), "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+except FileNotFoundError:
+    config= {
+        'OUTPUT_DIR': '.',
+        'PAGE_DELIMITER': '____NEXT PAGE____'
+    }
+except Exception as e:
+    print("unhandled while opening default config in pdf2markdown: ", e)
 
 
 class PDFExtractor(ABC):
@@ -46,7 +61,7 @@ class PDFExtractor(ABC):
         self.logger = logging.getLogger(__name__)
 
     @abstractmethod
-    def extract(self):
+    def extract(self) ->  tuple[object, list[object]] | tuple[Literal[''], list[object]] | None:
         """Abstract method for extracting content from PDF."""
         pass
 
@@ -56,11 +71,42 @@ class MarkdownPDFExtractor(PDFExtractor):
 
     BULLET_POINTS = "•◦▪▫●○"
 
-    def __init__(self, pdf_path):
+    def __init__(self, pdf_path, output_path= config.get("OUTPUT_DIR", '.'), page_delimiter= config.get("PAGE_DELIMITER", ''), model_name: str | None= None):
         super().__init__(pdf_path)
+
+        if model_name is None:
+            self.MODEL_NAME= "gemini-2.5-flash"
+        else:
+            self.MODEL_NAME= model_name
+
+        if  "gemini" in self.MODEL_NAME:
+            self.gclient = genai.Client(api_key= os.getenv("GEMINI_API_KEY", ''))
+        else:
+            model_path = "nanonets/Nanonets-OCR-s"
+            self.model = AutoModelForImageTextToText.from_pretrained(
+                model_path,
+                torch_dtype="auto",
+                device_map="auto",
+                attn_implementation="flash_attention_2"
+            )
+            self.model.eval()
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+            self.processor = AutoProcessor.from_pretrained(model_path)
+            self.setup_image_captioning()
+
+
+
+        self.markdown_content= ""
         self.pdf_filename = Path(pdf_path).stem
-        Path(config["OUTPUT_DIR"]).mkdir(parents=True, exist_ok=True)
-        self.setup_image_captioning()
+        self.output_path= output_path
+
+        output_filepath= f"{Path(self.output_path)}/{self.pdf_filename}.md"
+        self.output_filepath= output_filepath
+
+        self.page_delimiter= page_delimiter
+        Path(output_path).mkdir(parents=True, exist_ok=True)
+
+
 
     def setup_image_captioning(self):
         """Set up the image captioning model."""
@@ -85,8 +131,9 @@ class MarkdownPDFExtractor(PDFExtractor):
         try:
             markdown_content, markdown_pages = self.extract_markdown()
             self.save_markdown(markdown_content)
+            self.markdown_content= markdown_content
             self.logger.info(
-                f"Markdown content has been saved to {Path(config['OUTPUT_DIR'])}/{self.pdf_filename}.md"
+                f"Markdown content has been saved to {Path(self.output_path)}/{self.pdf_filename}.md"
             )
             return markdown_content, markdown_pages
 
@@ -95,31 +142,96 @@ class MarkdownPDFExtractor(PDFExtractor):
             self.logger.exception(traceback.format_exc())
             return "", []
 
+
+    def ocr_page_with_nanonets_s(self, pil_image, img_bytes, max_new_tokens: int | None = None):
+        prompt = """Extract the text from the above document as if you were reading it naturally. Return the tables in html format. Return the equations in LaTeX representation. If there is an image in the document and image caption is not present, add a small description of the image inside the <img></img> tag; otherwise, add the image caption inside <img></img>. Watermarks should be wrapped in brackets. Ex: <watermark>OFFICIAL COPY</watermark>. Page numbers should be wrapped in brackets. Ex: <page_number>14</page_number> or <page_number>9/22</page_number>. Prefer using ☐ and ☑ for check boxes."""
+        if max_new_tokens is None:
+            max_new_tokens= 4096
+
+        if 'gemini' in self.MODEL_NAME:
+
+            image_format = pil_image.format
+            dummy_filename = f"dummy.{image_format.lower()}"
+            mime_type, _ = mimetypes.guess_type(dummy_filename)
+            response=  self.gclient.models.generate_content(
+                model= self.MODEL_NAME,
+                contents=[
+                    types.Part.from_bytes(
+                        data=img_bytes.getvalue(),
+                        mime_type= mime_type
+                    ),
+                    prompt
+                ]
+            )
+            # print("response :", response)
+            return response.text
+        else:
+            image = pil_image
+            messages = [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": prompt},
+                ]},
+            ]
+            text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            inputs = self.processor(text=[text], images=[image], padding=True, return_tensors="pt")
+            inputs = inputs.to(self.model.device)
+
+            output_ids = self.model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+            generated_ids = [output_ids[len(input_ids):] for input_ids, output_ids in zip(inputs.input_ids, output_ids)]
+
+            output_text = self.processor.batch_decode(generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+            return output_text[0]
+
+
+
     def extract_markdown(self):
-        """Main method to extract markdown from PDF."""
-        try:
-            doc = fitz.open(self.pdf_path)
-            markdown_content = ""
-            markdown_pages = []
-            tables = self.extract_tables()
-            table_index = 0
-            list_counter = 0
-            in_code_block = False
-            code_block_content = ""
-            code_block_lang = None
-            prev_line = ""
+            """
+            Extracts all possible content from a PDF, prioritizing searchable text,
+            then OCR for embedded images, and finally full-page OCR for scanned pages.
+            Avoids redundant OCR where possible.
 
-            for page_num, page in enumerate(doc):
-                self.logger.info(f"Processing page {page_num + 1}")
-                page_content = ""
-                blocks = page.get_text("dict")["blocks"]
-                page_height = page.rect.height
-                links = self.extract_links(page)
+            Returns:
+                tuple: A tuple containing:
+                    - str: The concatenated markdown content of all pages.
+                    - list: A list of strings, where each string is the comprehensive markdown
+                            for a corresponding page.
+            """
+            all_pages_markdown = []
+            full_document_markdown = [] # Changed to list of lines/blocks to handle insertions better
 
-                if len(page.get_images()) > 0 and len(page.get_images()) <= 128:
-                    for block in blocks:
-                        if block["type"] == 0:  # Text
-                            page_content += self.process_text_block(
+            try:
+                doc = fitz.open(self.pdf_path)
+                self.logger.info(f"Opened PDF: {self.pdf_path}")
+
+                tables = self.extract_tables()
+                table_index = 0
+
+                # State variables for process_text_block that might need to persist across blocks
+                # Re-initialize for each new document, but allow state management within process_text_block for lines
+                list_counter = 0
+                in_code_block = False
+                code_block_content = ""
+                code_block_lang = None
+                prev_line = ""
+
+                for page_num, page in enumerate(doc):
+                    current_page_markdown_blocks = [] # Collect markdown blocks for the current page
+                    page_has_searchable_text = False
+                    page_has_embedded_images = False
+
+                    self.logger.info(f"\nProcessing page {page_num + 1}...")
+
+                    blocks = page.get_text('dict')['blocks']
+                    page_height = page.rect.height
+                    links = self.extract_links(page)
+
+                    # Phase 1: Process text blocks and embedded image blocks
+                    for block_num, block in enumerate(blocks):
+                        if block['type'] == 0:  # Text block
+                            page_has_searchable_text = True
+                            processed_text = self.process_text_block(
                                 block,
                                 page_height,
                                 links,
@@ -129,44 +241,98 @@ class MarkdownPDFExtractor(PDFExtractor):
                                 code_block_lang,
                                 prev_line,
                             )
-                        elif block["type"] == 1:  # Image
-                            page_content += self.process_image_block(page, block)
+                            if processed_text.strip():
+                                current_page_markdown_blocks.append(processed_text)
 
-                else:
-                    for block in blocks:
-                        if block["type"] == 0:  # Text
-                            page_content += self.process_text_block(
-                                block,
-                                page_height,
-                                links,
-                                list_counter,
-                                in_code_block,
-                                code_block_content,
-                                code_block_lang,
-                                prev_line,
+                        elif block['type'] == 1:  # Image block
+                            page_has_embedded_images = True
+                            self.logger.info(f"  Found embedded image block (Page {page_num+1}, Block {block_num+1})")
+                            img_data = block['image']
+
+                            try:
+                                image_bytes= io.BytesIO(img_data)
+                                pil_image = Image.open(image_bytes)
+                                ocr_text_from_block_image = self.ocr_page_with_nanonets_s(
+                                    pil_image, image_bytes, max_new_tokens=15000
+                                )
+
+                                if ocr_text_from_block_image.strip():
+                                    self.logger.info("    OCR found text in embedded image block.")
+                                    current_page_markdown_blocks.append(f"\n\n\n{ocr_text_from_block_image.strip()}\n\n")
+                                else:
+                                    self.logger.info(f"    No OCR text from embedded image block. Adding generic placeholder.")
+                                    current_page_markdown_blocks.append("\n\n![Image Placeholder](image_on_page_{page_num+1}_block_{block_num+1}.png)\n\n") # Consider saving images
+                            except Exception as e:
+                                self.logger.error(f"    Error processing embedded image block for OCR: {e}")
+                                current_page_markdown_blocks.append("\n\n![Image Processing Error](error_on_page_{page_num+1}_block_{block_num+1}.png)\n\n")
+
+
+                    # Insert tables at their approximate positions (after blocks are processed for the page)
+                    # You might need more sophisticated logic here if table positions are granular
+                    while (
+                        table_index < len(tables)
+                        and tables[table_index]["page"] == page.number
+                    ):
+                        current_page_markdown_blocks.append(
+                            self.table_to_markdown(tables[table_index]["content"])
+                        )
+                        table_index += 1
+
+                    # Phase 2: Full-page OCR if the page seems to be a scanned image or lacks sufficient searchable text
+                    # We prioritize actual searchable text and embedded image OCR.
+                    # Only if very little or no text was found, we resort to full-page OCR.
+                    combined_current_page_text_length = len("".join(current_page_markdown_blocks).strip())
+
+                    # A heuristic: if almost no searchable text and no significant OCR from embedded images
+                    if not page_has_searchable_text and combined_current_page_text_length < 100: # Threshold for considering "minimal text"
+                        self.logger.info(f"  Page {page_num + 1} appears to be a scanned image or has minimal text. Attempting full-page OCR.")
+                        try:
+                            pix = page.get_pixmap(matrix=fitz.Matrix(300/72, 300/72))
+                            img_bytes = pix.tobytes("png")
+                            image_bytestream= io.BytesIO(img_bytes)
+                            pil_image = Image.open(image_bytestream)
+
+                            ocr_text_from_page = self.ocr_page_with_nanonets_s(
+                                pil_image, image_bytestream, max_new_tokens=15000
                             )
 
-                # Insert tables at their approximate positions
-                while (
-                    table_index < len(tables)
-                    and tables[table_index]["page"] == page.number
-                ):
-                    page_content += (
-                        "\n\n"
-                        + self.table_to_markdown(tables[table_index]["content"])
-                        + "\n\n"
-                    )
-                    table_index += 1
+                            if ocr_text_from_page.strip():
+                                self.logger.info(f"  Successfully extracted text via full-page OCR for page {page_num + 1}.")
+                                # If full-page OCR yields significant content and other methods didn't,
+                                # replace or augment. Here, we'll replace to avoid double-counting if it's primarily scanned.
+                                # You might choose to append if you want to combine (e.g., if there's header text + scanned body)
+                                if combined_current_page_text_length < 50: # If almost nothing was found before, replace
+                                    current_page_markdown_blocks = [ocr_text_from_page.strip()]
+                                else: # Otherwise, augment (append)
+                                    current_page_markdown_blocks.append(f"\n\n\n{ocr_text_from_page.strip()}\n\n")
+                            else:
+                                self.logger.info(f"  Full-page OCR yielded no text for page {page_num+1}.")
+                        except Exception as e:
+                            self.logger.error(f"  Error during full-page OCR on page {page_num+1}: {e}")
+                    else:
+                        self.logger.info(f"  Page {page_num + 1} has sufficient searchable text or embedded image OCR; skipping full-page OCR.")
 
-                markdown_pages.append(self.post_process_markdown(page_content))
-                markdown_content += page_content + config["PAGE_DELIMITER"]
+                    # Join collected markdown blocks for the current page
+                    final_page_markdown = "\n".join(filter(None, current_page_markdown_blocks)).strip()
+                    all_pages_markdown.append(self.post_process_markdown(final_page_markdown))
+                    full_document_markdown.append(self.post_process_markdown(final_page_markdown))
+                    full_document_markdown.append(self.page_delimiter)
 
-            markdown_content = self.post_process_markdown(markdown_content)
-            return markdown_content, markdown_pages
-        except Exception as e:
-            self.logger.error(f"Error extracting markdown: {e}")
-            self.logger.exception(traceback.format_exc())
-            return "", []
+
+                    self.logger.info(f"  Comprehensive text for page {page_num + 1} (first 200 chars):\n{final_page_markdown[:200]}...")
+                    print(f"\n--- Page {page_num+1} Done ---\n")
+                    print(final_page_markdown[:500]) # Print first 500 chars of page markdown
+
+                doc.close()
+                return "".join(full_document_markdown), all_pages_markdown
+
+            except fitz.FileNotFoundError:
+                self.logger.error(f"PDF file not found: {self.pdf_path}")
+                return "", []
+            except Exception as e:
+                self.logger.critical(f"An unexpected error occurred during markdown extraction: {e}")
+                self.logger.exception(traceback.format_exc())
+                return "", []
 
     def extract_tables(self):
         """Extract tables from PDF using pdfplumber."""
@@ -217,32 +383,25 @@ class MarkdownPDFExtractor(PDFExtractor):
             self.logger.exception(traceback.format_exc())
             return ""
 
-    def perform_ocr(self, image):
+    def perform_ocr(self, image, image_bytes):
         """Perform OCR on the given image."""
         try:
-            opencv_image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-            ocr_result = pytesseract.image_to_data(
-                opencv_image, output_type=pytesseract.Output.DICT
-            )
+            # ocr_result = pytesseract.image_to_string(
+            #     image
+            # )
+            ocr_result= self.ocr_page_with_nanonets_s(image, image_bytes, max_new_tokens=15000)
 
-            result = ""
-            for word in ocr_result["text"]:
-                if word.strip() != "":
-                    result += word + " "
 
-                if len(result) > 30:
-                    break
-
-            return result.strip()
+            return ocr_result.strip()
         except Exception as e:
             self.logger.error(f"Error performing OCR: {e}")
             self.logger.exception(traceback.format_exc())
             return ""
 
-    def caption_image(self, image):
+    def caption_image(self, image, image_bytes):
         """Generate a caption for the given image."""
         try:
-            ocr_text = self.perform_ocr(image)
+            ocr_text = self.perform_ocr(image, image_bytes)
             if ocr_text:
                 return ocr_text
 
@@ -250,19 +409,38 @@ class MarkdownPDFExtractor(PDFExtractor):
             if image.mode != "RGB":
                 image = image.convert("RGB")
 
-            # Ensure the image is in the correct shape
-            image = np.array(image).transpose(2, 0, 1)  # Convert to (C, H, W) format
+            image_format = image.format
+            dummy_filename = f"dummy.{image_format.lower()}"
+            mime_type, _ = mimetypes.guess_type(dummy_filename)
 
-            inputs = self.feature_extractor(images=image, return_tensors="pt").to(
-                self.device
-            )
-            pixel_values = inputs.pixel_values
+            if "gemini" in self.MODEL_NAME:
+                response=  self.gclient.models.generate_content(
+                    model= self.MODEL_NAME,
+                    contents=[
+                        types.Part.from_bytes(
+                            data=image_bytes.getvalue(),
+                            mime_type= mime_type
+                        ),
+                        "Write a caption for this image"
+                    ]
+                )
+                return response.text
+            else:
+                # Ensure the image is in the correct shape
+                image = np.array(image).transpose(2, 0, 1)  # Convert to (C, H, W) format
 
-            generated_ids = self.model.generate(pixel_values, max_length=30)
-            generated_caption = self.tokenizer.batch_decode(
-                generated_ids, skip_special_tokens=True
-            )[0]
-            return generated_caption.strip()
+                inputs = self.feature_extractor(images=image, return_tensors="pt").to(
+                    self.device
+                )
+                pixel_values = inputs.pixel_values
+
+                generated_ids = self.model.generate(pixel_values, max_length=30)
+
+                generated_ids = self.model.generate(pixel_values, max_length=30)
+                generated_caption = self.tokenizer.batch_decode(
+                    generated_ids, skip_special_tokens=True
+                )[0]
+                return generated_caption.strip()
         except Exception as e:
             self.logger.error(f"Error captioning image: {e}")
             self.logger.exception(traceback.format_exc())
@@ -561,11 +739,14 @@ class MarkdownPDFExtractor(PDFExtractor):
                 f"{self.pdf_filename}_image_{int(page.number)+1}_{block['number']}.png"
             )
             image_path = (
-                Path(config["OUTPUT_DIR"]) / image_filename
+                Path(self.output_path) / image_filename
             )  # Convert to Path object
             image.save(image_path, "PNG", optimize=True, quality=95)
 
-            caption = self.caption_image(image)
+            img_byte_arr = io.BytesIO()
+            image.save(img_byte_arr)
+            caption = self.caption_image(image, img_byte_arr)
+
             if not caption:
                 caption = (
                     f"{self.pdf_filename}_image_{int(page.number)+1}_{block['number']}"
@@ -635,9 +816,9 @@ class MarkdownPDFExtractor(PDFExtractor):
     def save_markdown(self, markdown_content):
         """Save the markdown content to a file."""
         try:
-            os.makedirs(Path(config["OUTPUT_DIR"]), exist_ok=True)
+            os.makedirs(Path(self.output_path), exist_ok=True)
             with open(
-                f"{Path(config['OUTPUT_DIR'])}/{self.pdf_filename}.md",
+                self.output_filepath,
                 "w",
                 encoding="utf-8",
             ) as f:
