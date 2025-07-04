@@ -2,11 +2,9 @@ import fitz
 import pdfplumber
 import re
 import yaml
-# import pytesseract
+import pytesseract
 import numpy as np
-from transformers import AutoTokenizer, AutoProcessor, AutoModelForImageTextToText, VisionEncoderDecoderModel, ViTImageProcessor
 from typing import Literal, final
-import torch
 from PIL import Image
 import os
 import logging
@@ -19,6 +17,9 @@ import io
 from google import genai
 from google.genai import types
 import mimetypes
+from gradio_client import Client, handle_file
+import gradio as gr
+import tempfile
 
 
 
@@ -75,25 +76,18 @@ class MarkdownPDFExtractor(PDFExtractor):
         super().__init__(pdf_path)
 
         if model_name is None:
-            self.MODEL_NAME= "gemini-2.5-flash"
+            # self.MODEL_NAME= "gemini-2.5-flash"
+            self.MODEL_NAME= "Nanonets-OCR-s"
         else:
             self.MODEL_NAME= model_name
 
         if  "gemini" in self.MODEL_NAME:
             self.gclient = genai.Client(api_key= os.getenv("GEMINI_API_KEY", ''))
-        else:
-            model_path = "nanonets/Nanonets-OCR-s"
-            self.model = AutoModelForImageTextToText.from_pretrained(
-                model_path,
-                torch_dtype="auto",
-                device_map="auto",
-                attn_implementation="flash_attention_2"
-            )
-            self.model.eval()
-            self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-            self.processor = AutoProcessor.from_pretrained(model_path)
-            self.setup_image_captioning()
+        elif "anonet" in self.MODEL_NAME:
+            # self.nclient= Client("prithivMLmods/Multimodal-OCR2")
 
+            # zerogpu public
+            self.nclient= Client("MohamedRashad/Nanonets-OCR")
 
 
         self.markdown_content= ""
@@ -107,25 +101,6 @@ class MarkdownPDFExtractor(PDFExtractor):
         Path(output_path).mkdir(parents=True, exist_ok=True)
 
 
-
-    def setup_image_captioning(self):
-        """Set up the image captioning model."""
-        try:
-            self.model = VisionEncoderDecoderModel.from_pretrained(
-                "nlpconnect/vit-gpt2-image-captioning"
-            )
-            self.feature_extractor = ViTImageProcessor.from_pretrained(
-                "nlpconnect/vit-gpt2-image-captioning"
-            )
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                "nlpconnect/vit-gpt2-image-captioning"
-            )
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            self.model.to(self.device)
-            self.logger.info("Image captioning model set up successfully.")
-        except Exception as e:
-            self.logger.error(f"Error setting up image captioning model: {e}")
-            self.logger.exception(traceback.format_exc())
 
     def extract(self):
         try:
@@ -143,12 +118,18 @@ class MarkdownPDFExtractor(PDFExtractor):
             return "", []
 
 
-    def ocr_page_with_nanonets_s(self, pil_image, img_bytes, max_new_tokens: int | None = None):
-        prompt = """Extract the text from the above document as if you were reading it naturally. Return the tables in html format. Return the equations in LaTeX representation. If there is an image in the document and image caption is not present, add a small description of the image inside the <img></img> tag; otherwise, add the image caption inside <img></img>. Watermarks should be wrapped in brackets. Ex: <watermark>OFFICIAL COPY</watermark>. Page numbers should be wrapped in brackets. Ex: <page_number>14</page_number> or <page_number>9/22</page_number>. Prefer using ☐ and ☑ for check boxes."""
+    def image_ocr(self, pil_image, img_bytes, max_new_tokens: int | None = None, prompt: str | None= None):
+        if prompt is None:
+            prompt = """Extract the text from the above document as if you were reading it naturally. Return the tables in html format. Return the equations in LaTeX representation. If there is an image in the document and image caption is not present, add a small description of the image inside the <img></img> tag; otherwise, add the image caption inside <img></img>. Watermarks should be wrapped in brackets. Ex: <watermark>OFFICIAL COPY</watermark>. Page numbers should be wrapped in brackets. Ex: <page_number>14</page_number> or <page_number>9/22</page_number>. Prefer using ☐ and ☑ for check boxes."""
         if max_new_tokens is None:
             max_new_tokens= 4096
 
-        if 'gemini' in self.MODEL_NAME:
+        w, h= pil_image.size
+        if w < 200 or h < 50:
+            return "<img> A small image </img>"
+
+        model_name= self.MODEL_NAME.lower()
+        if 'gemini' in model_name:
 
             image_format = pil_image.format
             dummy_filename = f"dummy.{image_format.lower()}"
@@ -165,24 +146,38 @@ class MarkdownPDFExtractor(PDFExtractor):
             )
             # print("response :", response)
             return response.text
+        elif 'nanonet' in model_name:
+
+            result= ""
+            try:
+                with tempfile.NamedTemporaryFile(suffix=f'.{pil_image.format.lower()}', mode= 'w') as temp_file:
+                    pil_image.save(temp_file.name)
+                    print("file name: ", temp_file.name)
+                    gr_image= handle_file(temp_file.name)
+                    print("gr image : ", gr_image)
+                    result = self.nclient.predict(
+                        # model_name="Nanonets-OCR-s",
+                        # text= prompt,
+                        image= gr_image,
+                        # max_new_tokens=max_new_tokens,
+                        # temperature=0.6,
+                        # top_p=0.9,
+                        # top_k=50,
+                        # repetition_penalty=1.2,
+
+                        # prithiv model
+                        # api_name="/generate_image"
+
+                        # rashad zerogpu
+                        api_name="/ocr_image_gradio"
+                    )
+                    print("ocr'd: ", result[:100] + "...")
+            except Exception as e:
+                print("Error during nanonet inference", e)
+            
+            return result
         else:
-            image = pil_image
-            messages = [
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": [
-                    {"type": "image", "image": image},
-                    {"type": "text", "text": prompt},
-                ]},
-            ]
-            text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            inputs = self.processor(text=[text], images=[image], padding=True, return_tensors="pt")
-            inputs = inputs.to(self.model.device)
-
-            output_ids = self.model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
-            generated_ids = [output_ids[len(input_ids):] for input_ids, output_ids in zip(inputs.input_ids, output_ids)]
-
-            output_text = self.processor.batch_decode(generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
-            return output_text[0]
+            return pytesseract.image_to_string(pil_image)
 
 
 
@@ -219,7 +214,7 @@ class MarkdownPDFExtractor(PDFExtractor):
                 for page_num, page in enumerate(doc):
                     current_page_markdown_blocks = [] # Collect markdown blocks for the current page
                     page_has_searchable_text = False
-                    page_has_embedded_images = False
+                    # page_has_embedded_images = False
 
                     self.logger.info(f"\nProcessing page {page_num + 1}...")
 
@@ -252,7 +247,7 @@ class MarkdownPDFExtractor(PDFExtractor):
                             try:
                                 image_bytes= io.BytesIO(img_data)
                                 pil_image = Image.open(image_bytes)
-                                ocr_text_from_block_image = self.ocr_page_with_nanonets_s(
+                                ocr_text_from_block_image = self.image_ocr(
                                     pil_image, image_bytes, max_new_tokens=15000
                                 )
 
@@ -292,7 +287,7 @@ class MarkdownPDFExtractor(PDFExtractor):
                             image_bytestream= io.BytesIO(img_bytes)
                             pil_image = Image.open(image_bytestream)
 
-                            ocr_text_from_page = self.ocr_page_with_nanonets_s(
+                            ocr_text_from_page = self.image_ocr(
                                 pil_image, image_bytestream, max_new_tokens=15000
                             )
 
@@ -389,7 +384,7 @@ class MarkdownPDFExtractor(PDFExtractor):
             # ocr_result = pytesseract.image_to_string(
             #     image
             # )
-            ocr_result= self.ocr_page_with_nanonets_s(image, image_bytes, max_new_tokens=15000)
+            ocr_result= self.image_ocr(image, image_bytes, max_new_tokens=15000)
 
 
             return ocr_result.strip()
@@ -409,38 +404,9 @@ class MarkdownPDFExtractor(PDFExtractor):
             if image.mode != "RGB":
                 image = image.convert("RGB")
 
-            image_format = image.format
-            dummy_filename = f"dummy.{image_format.lower()}"
-            mime_type, _ = mimetypes.guess_type(dummy_filename)
+            caption= self.image_ocr(image, image_bytes, max_new_tokens=15000, prompt= "Write a caption for this image")
+            return caption
 
-            if "gemini" in self.MODEL_NAME:
-                response=  self.gclient.models.generate_content(
-                    model= self.MODEL_NAME,
-                    contents=[
-                        types.Part.from_bytes(
-                            data=image_bytes.getvalue(),
-                            mime_type= mime_type
-                        ),
-                        "Write a caption for this image"
-                    ]
-                )
-                return response.text
-            else:
-                # Ensure the image is in the correct shape
-                image = np.array(image).transpose(2, 0, 1)  # Convert to (C, H, W) format
-
-                inputs = self.feature_extractor(images=image, return_tensors="pt").to(
-                    self.device
-                )
-                pixel_values = inputs.pixel_values
-
-                generated_ids = self.model.generate(pixel_values, max_length=30)
-
-                generated_ids = self.model.generate(pixel_values, max_length=30)
-                generated_caption = self.tokenizer.batch_decode(
-                    generated_ids, skip_special_tokens=True
-                )[0]
-                return generated_caption.strip()
         except Exception as e:
             self.logger.error(f"Error captioning image: {e}")
             self.logger.exception(traceback.format_exc())
