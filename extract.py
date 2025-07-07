@@ -87,7 +87,7 @@ class MarkdownPDFExtractor(PDFExtractor):
             # self.nclient= Client("prithivMLmods/Multimodal-OCR2")
 
             # zerogpu public
-            self.nclient= Client("MohamedRashad/Nanonets-OCR")
+            self.nclient= Client("deepak-mehta/ocr-simplify", hf_token= os.getenv('HF_TOKEN', ''))
 
 
         self.markdown_content= ""
@@ -158,7 +158,7 @@ class MarkdownPDFExtractor(PDFExtractor):
                     result = self.nclient.predict(
                         # model_name="Nanonets-OCR-s",
                         # text= prompt,
-                        image= gr_image,
+                        gr_image,
                         # max_new_tokens=max_new_tokens,
                         # temperature=0.6,
                         # top_p=0.9,
@@ -168,8 +168,10 @@ class MarkdownPDFExtractor(PDFExtractor):
                         # prithiv model
                         # api_name="/generate_image"
 
-                        # rashad zerogpu
-                        api_name="/ocr_image_gradio"
+                        max_new_tokens,
+
+                        # spaces zerogpu
+                        api_name="/predict"
                     )
                     print("ocr'd: ", result[:100] + "...")
             except Exception as e:
