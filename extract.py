@@ -115,6 +115,10 @@ class MarkdownPDFExtractor(PDFExtractor):
         except Exception as e:
             self.logger.error(f"Error processing PDF: {e}")
             self.logger.exception(traceback.format_exc())
+
+            error_message= str(e).lower()
+            if "GPU" in error_message and "quota" in error_message:
+                return "GPU quota error", []
             return "", []
 
 
@@ -176,6 +180,12 @@ class MarkdownPDFExtractor(PDFExtractor):
                     print("ocr'd: ", result[:100] + "...")
             except Exception as e:
                 print("Error during nanonet inference", e)
+                error_message = str(e)
+                if "You have exceeded your Pro GPU quota" in error_message:
+                    # print("\n\n\nFALLING BACK TO TESS\n\n\n")
+                    # return pytesseract.image_to_string(pil_image)
+                    raise e
+
             
             return result
         else:
@@ -262,6 +272,9 @@ class MarkdownPDFExtractor(PDFExtractor):
                             except Exception as e:
                                 self.logger.error(f"    Error processing embedded image block for OCR: {e}")
                                 current_page_markdown_blocks.append("\n\n![Image Processing Error](error_on_page_{page_num+1}_block_{block_num+1}.png)\n\n")
+                                error_message= str(e).lower()
+                                if "GPU" in error_message and "quota" in error_message:
+                                    raise e
 
 
                     # Insert tables at their approximate positions (after blocks are processed for the page)
@@ -306,6 +319,9 @@ class MarkdownPDFExtractor(PDFExtractor):
                                 self.logger.info(f"  Full-page OCR yielded no text for page {page_num+1}.")
                         except Exception as e:
                             self.logger.error(f"  Error during full-page OCR on page {page_num+1}: {e}")
+                            error_message= str(e).lower()
+                            if "GPU" in error_message and "quota" in error_message:
+                                raise e
                     else:
                         self.logger.info(f"  Page {page_num + 1} has sufficient searchable text or embedded image OCR; skipping full-page OCR.")
 
@@ -329,7 +345,12 @@ class MarkdownPDFExtractor(PDFExtractor):
             except Exception as e:
                 self.logger.critical(f"An unexpected error occurred during markdown extraction: {e}")
                 self.logger.exception(traceback.format_exc())
-                return "", []
+
+                error_message= str(e).lower()
+                if "GPU" in error_message and "quota" in error_message:
+                    return "GPU quota error", []
+                else:
+                    return "", []
 
     def extract_tables(self):
         """Extract tables from PDF using pdfplumber."""
@@ -412,6 +433,9 @@ class MarkdownPDFExtractor(PDFExtractor):
         except Exception as e:
             self.logger.error(f"Error captioning image: {e}")
             self.logger.exception(traceback.format_exc())
+            error_message= str(e)
+            if "GPU" in error_message and "quota" in error_message:
+                raise e
             return ""
 
     def clean_text(self, text):
@@ -725,6 +749,7 @@ class MarkdownPDFExtractor(PDFExtractor):
             self.logger.error(f"Error processing image block: {e}")
             self.logger.exception(traceback.format_exc())
             return ""
+
 
     def get_header_level(self, font_size):
         """Determine header level based on font size."""
